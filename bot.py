@@ -1,7 +1,9 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List
+import random
+import time
+from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
@@ -22,9 +24,20 @@ logger = logging.getLogger(__name__)
 # إعدادات البوت
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DOWNLOAD_PATH = os.getenv('DOWNLOAD_PATH', './downloads/')
+USE_PROXY = os.getenv('USE_PROXY', 'false').lower() == 'true'
+PROXY_URL = os.getenv('PROXY_URL', '')
 
 # إنشاء مجلد التحميل إذا لم يكن موجوداً
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+
+# قائمة User Agents عشوائية لتجنب اكتشاف البوت
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+]
 
 class YouTubeTelegramBot:
     def __init__(self):
@@ -83,6 +96,39 @@ class YouTubeTelegramBot:
                 )
                 return
             
+            # معالجة الأخطاء المختلفة
+            if 'error' in video_info:
+                error_type = video_info.get('error')
+                error_messages = {
+                    'geo_restricted': "🌍 **الفيديو غير متاح في بلدك**\n\n"
+                                    "💡 **الحلول المقترحة:**\n"
+                                    "• استخدم VPN للاتصال من بلد آخر\n"
+                                    "• جرب رابطاً آخر من نفس القناة\n"
+                                    "• تواصل مع المسؤول لإعداد بروكسي",
+                    
+                    'login_required': "🔒 **يوتيوب يطلب تسجيل الدخول**\n\n"
+                                    "💡 **الحلول المقترحة:**\n"
+                                    "• انتظر قليلاً وحاول مرة أخرى\n"
+                                    "• استخدم VPN للتغيير من موقعك\n"
+                                    "• جرب فيديو آخر من قناة مختلفة",
+                    
+                    'unavailable': "❌ **الفيديو غير متاح**\n\n"
+                                 "💡 **الأسباب المحتملة:**\n"
+                                 "• الفيديو محذوف أو خاص\n"
+                                 "• القناة محظورة أو معلقة\n"
+                                 "• مشكلة مؤقتة في يوتيوب",
+                    
+                    'extraction_failed': "⚠️ **فشل في استخراج معلومات الفيديو**\n\n"
+                                       "💡 **جرب:**\n"
+                                       "• إعادة إرسال الرابط\n"
+                                       "• التأكد من صحة الرابط\n"
+                                       "• المحاولة لاحقاً",
+                }
+                
+                error_msg = error_messages.get(error_type, "❌ حدث خطأ غير معروف!")
+                await loading_message.edit_text(error_msg, parse_mode=ParseMode.MARKDOWN)
+                return
+            
             # حفظ معلومات الجلسة
             self.user_sessions[user_id] = {
                 'url': url,
@@ -125,20 +171,92 @@ class YouTubeTelegramBot:
         youtube_domains = ['youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com']
         return any(domain in url for domain in youtube_domains)
 
-    async def get_video_info(self, url: str) -> Dict:
-        """الحصول على معلومات الفيديو"""
-        ydl_opts = {
+    def get_ydl_opts(self, for_download: bool = False) -> Dict:
+        """إنشاء خيارات yt-dlp محسنة"""
+        opts = {
             'quiet': True,
             'no_warnings': True,
+            'user_agent': random.choice(USER_AGENTS),
+            'sleep_interval': random.uniform(1, 3),
+            'max_sleep_interval': 5,
+            'extractor_retries': 3,
+            'fragment_retries': 3,
+            'retry_sleep_functions': {
+                'http': lambda n: random.uniform(1, 3) * (2 ** n),
+                'fragment': lambda n: random.uniform(1, 2) * (2 ** n),
+            },
+            # إعدادات لتجنب اكتشاف البوت
+            'http_headers': {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
+            # تجاهل الأخطاء المؤقتة
+            'ignoreerrors': False,
+            'extract_flat': False,
         }
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                return info
-        except Exception as e:
-            logger.error(f"خطأ في استخراج معلومات الفيديو: {e}")
-            return None
+        # إضافة البروكسي إذا كان متاحاً
+        if USE_PROXY and PROXY_URL:
+            opts['proxy'] = PROXY_URL
+            logger.info("استخدام البروكسي للاتصال")
+        
+        # إعدادات إضافية للتحميل
+        if for_download:
+            opts.update({
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+                'writedescription': False,
+                'writeinfojson': False,
+                'writethumbnail': False,
+            })
+        
+        return opts
+
+    async def get_video_info(self, url: str) -> Optional[Dict]:
+        """الحصول على معلومات الفيديو مع معالجة أفضل للأخطاء"""
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # إضافة تأخير عشوائي بين المحاولات
+                if attempt > 0:
+                    delay = random.uniform(2, 5) * attempt
+                    logger.info(f"إعادة المحاولة {attempt + 1} بعد {delay:.1f} ثانية...")
+                    await asyncio.sleep(delay)
+                
+                ydl_opts = self.get_ydl_opts()
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+                    return info
+                    
+            except yt_dlp.utils.GeoRestrictedError as e:
+                logger.error(f"الفيديو غير متاح في هذا البلد: {e}")
+                return {'error': 'geo_restricted', 'message': str(e)}
+                
+            except yt_dlp.utils.ExtractorError as e:
+                error_msg = str(e).lower()
+                if 'sign in' in error_msg or 'not a bot' in error_msg:
+                    logger.error(f"يوتيوب يطلب تسجيل الدخول: {e}")
+                    return {'error': 'login_required', 'message': str(e)}
+                elif 'private' in error_msg or 'unavailable' in error_msg:
+                    logger.error(f"الفيديو غير متاح: {e}")
+                    return {'error': 'unavailable', 'message': str(e)}
+                else:
+                    logger.error(f"خطأ في استخراج الفيديو: {e}")
+                    if attempt == max_retries - 1:
+                        return {'error': 'extraction_failed', 'message': str(e)}
+                    
+            except Exception as e:
+                logger.error(f"خطأ عام في استخراج معلومات الفيديو: {e}")
+                if attempt == max_retries - 1:
+                    return {'error': 'unknown', 'message': str(e)}
+        
+        return None
 
     def create_quality_keyboard(self, video_info: Dict) -> InlineKeyboardMarkup:
         """إنشاء لوحة مفاتيح اختيار الجودة"""
@@ -224,30 +342,54 @@ class YouTubeTelegramBot:
             if user_id in self.user_sessions:
                 del self.user_sessions[user_id]
 
-    async def download_video(self, url: str, quality: str) -> str:
-        """تحميل الفيديو بجودة محددة"""
+    async def download_video(self, url: str, quality: str) -> Optional[str]:
+        """تحميل الفيديو بجودة محددة مع معالجة محسنة للأخطاء"""
         output_path = os.path.join(DOWNLOAD_PATH, f"video_{quality}p_%(title)s.%(ext)s")
         
-        ydl_opts = {
+        ydl_opts = self.get_ydl_opts(for_download=True)
+        ydl_opts.update({
             'format': f'best[height<={quality}]/best',
             'outtmpl': output_path,
-            'quiet': True,
-        }
+        })
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                filename = ydl.prepare_filename(info)
-                return filename
-        except Exception as e:
-            logger.error(f"خطأ في تحميل الفيديو: {e}")
-            return None
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = random.uniform(3, 6)
+                    logger.info(f"إعادة محاولة التحميل بعد {delay:.1f} ثانية...")
+                    await asyncio.sleep(delay)
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+                    filename = ydl.prepare_filename(info)
+                    
+                    # التحقق من وجود الملف
+                    if os.path.exists(filename):
+                        return filename
+                    
+                    # البحث عن الملف بامتدادات مختلفة
+                    base_name = os.path.splitext(filename)[0]
+                    for ext in ['.mp4', '.webm', '.mkv', '.avi']:
+                        test_file = base_name + ext
+                        if os.path.exists(test_file):
+                            return test_file
+                    
+                    logger.error(f"لم يتم العثور على الملف المحمل: {filename}")
+                    
+            except Exception as e:
+                logger.error(f"خطأ في تحميل الفيديو (محاولة {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return None
+        
+        return None
 
-    async def download_audio(self, url: str) -> str:
-        """تحميل الصوت فقط"""
+    async def download_audio(self, url: str) -> Optional[str]:
+        """تحميل الصوت فقط مع معالجة محسنة للأخطاء"""
         output_path = os.path.join(DOWNLOAD_PATH, "audio_%(title)s.%(ext)s")
         
-        ydl_opts = {
+        ydl_opts = self.get_ydl_opts(for_download=True)
+        ydl_opts.update({
             'format': 'bestaudio/best',
             'outtmpl': output_path,
             'postprocessors': [{
@@ -255,19 +397,40 @@ class YouTubeTelegramBot:
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'quiet': True,
-        }
+        })
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                filename = ydl.prepare_filename(info)
-                # تغيير امتداد الملف إلى mp3
-                audio_filename = os.path.splitext(filename)[0] + '.mp3'
-                return audio_filename
-        except Exception as e:
-            logger.error(f"خطأ في تحميل الصوت: {e}")
-            return None
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = random.uniform(3, 6)
+                    logger.info(f"إعادة محاولة تحميل الصوت بعد {delay:.1f} ثانية...")
+                    await asyncio.sleep(delay)
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+                    filename = ydl.prepare_filename(info)
+                    
+                    # البحث عن ملف MP3
+                    audio_filename = os.path.splitext(filename)[0] + '.mp3'
+                    if os.path.exists(audio_filename):
+                        return audio_filename
+                    
+                    # البحث عن ملفات صوتية أخرى
+                    base_name = os.path.splitext(filename)[0]
+                    for ext in ['.m4a', '.webm', '.ogg', '.wav']:
+                        test_file = base_name + ext
+                        if os.path.exists(test_file):
+                            return test_file
+                    
+                    logger.error(f"لم يتم العثور على الملف الصوتي: {audio_filename}")
+                    
+            except Exception as e:
+                logger.error(f"خطأ في تحميل الصوت (محاولة {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return None
+        
+        return None
 
     async def send_file(self, query, file_path: str):
         """إرسال الملف للمستخدم"""
