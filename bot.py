@@ -3,6 +3,10 @@ import asyncio
 import logging
 import random
 import time
+import requests
+import urllib.parse
+import re
+import json
 from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -42,6 +46,213 @@ USER_AGENTS = [
 class YouTubeTelegramBot:
     def __init__(self):
         self.user_sessions: Dict[int, Dict] = {}
+        self.proxy_status: Dict[str, bool] = {}  # كاش لحالة البروكسي
+        
+    def extract_video_id(self, url: str) -> Optional[str]:
+        """استخراج معرف الفيديو من رابط يوتيوب باستخدام regex"""
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})',
+            r'youtu\.be\/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com\/v\/([a-zA-Z0-9_-]{11})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                video_id = match.group(1)
+                logger.info(f"تم استخراج معرف الفيديو: {video_id}")
+                return video_id
+        
+        logger.warning(f"فشل في استخراج معرف الفيديو من: {url}")
+        return None
+    
+    async def get_video_info_direct(self, video_id: str) -> Optional[Dict]:
+        """الحصول على معلومات الفيديو مباشرة من يوتيوب بدون yt-dlp"""
+        try:
+            # استخدام طرق مختلفة للحصول على معلومات الفيديو
+            methods = [
+                self._get_video_info_method1,
+                self._get_video_info_method2,
+                self._get_video_info_method3
+            ]
+            
+            for method in methods:
+                try:
+                    result = await method(video_id)
+                    if result and 'title' in result:
+                        logger.info(f"نجح في الحصول على معلومات الفيديو باستخدام الطريقة: {method.__name__}")
+                        return result
+                except Exception as e:
+                    logger.warning(f"فشل في {method.__name__}: {e}")
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"خطأ في get_video_info_direct: {e}")
+            return None
+    
+    async def _get_video_info_method1(self, video_id: str) -> Optional[Dict]:
+        """الطريقة الأولى: استخدام YouTube oEmbed API"""
+        try:
+            url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            
+            response = await asyncio.to_thread(
+                requests.get, url, 
+                proxies=proxies, 
+                headers=headers, 
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'id': video_id,
+                    'title': data.get('title', 'غير معروف'),
+                    'uploader': data.get('author_name', 'غير معروف'),
+                    'duration': 0,  # oEmbed لا يوفر المدة
+                    'thumbnail': data.get('thumbnail_url', ''),
+                    'webpage_url': f"https://www.youtube.com/watch?v={video_id}",
+                    'method': 'oembed'
+                }
+            
+        except Exception as e:
+            logger.warning(f"فشل في oEmbed API: {e}")
+            raise
+        
+        return None
+    
+    async def _get_video_info_method2(self, video_id: str) -> Optional[Dict]:
+        """الطريقة الثانية: scraping صفحة الفيديو"""
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            response = await asyncio.to_thread(
+                requests.get, url, 
+                proxies=proxies, 
+                headers=headers, 
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                html = response.text
+                
+                # استخراج العنوان
+                title_match = re.search(r'<title>(.+?) - YouTube</title>', html)
+                title = title_match.group(1) if title_match else 'غير معروف'
+                
+                # استخراج اسم القناة
+                channel_match = re.search(r'"ownerChannelName":"([^"]+)"', html)
+                uploader = channel_match.group(1) if channel_match else 'غير معروف'
+                
+                # استخراج المدة
+                duration_match = re.search(r'"lengthSeconds":"(\d+)"', html)
+                duration = int(duration_match.group(1)) if duration_match else 0
+                
+                # استخراج الصورة المصغرة
+                thumbnail_match = re.search(r'"playerMicroformatRenderer".*?"thumbnail".*?"url":"([^"]+)"', html)
+                thumbnail = thumbnail_match.group(1).replace('\\', '') if thumbnail_match else ''
+                
+                return {
+                    'id': video_id,
+                    'title': title,
+                    'uploader': uploader,
+                    'duration': duration,
+                    'thumbnail': thumbnail,
+                    'webpage_url': url,
+                    'method': 'scraping'
+                }
+                
+        except Exception as e:
+            logger.warning(f"فشل في scraping: {e}")
+            raise
+        
+        return None
+    
+    async def _get_video_info_method3(self, video_id: str) -> Optional[Dict]:
+        """الطريقة الثالثة: محاولة استخدام YouTube Data API v3 (إذا كان متاحاً)"""
+        try:
+            # هذه الطريقة تحتاج API key، لكن يمكن إضافتها لاحقاً
+            # حالياً سنرجع None لتجربة الطرق الأخرى
+            return None
+            
+        except Exception as e:
+            logger.warning(f"فشل في YouTube Data API: {e}")
+            raise
+        
+    async def test_proxy_connection(self) -> Dict[str, any]:
+        """اختبار اتصال البروكسي"""
+        if not USE_PROXY or not PROXY_URL:
+            return {'status': 'disabled', 'message': 'البروكسي غير مفعل'}
+        
+        # التحقق من الكاش أولاً
+        cache_key = PROXY_URL
+        if cache_key in self.proxy_status:
+            return {'status': 'cached', 'working': self.proxy_status[cache_key]}
+        
+        test_urls = [
+            'http://httpbin.org/ip',
+            'http://ipinfo.io/json',
+            'https://api.ipify.org?format=json'
+        ]
+        
+        for test_url in test_urls:
+            try:
+                # إعداد البروكسي للطلب
+                proxies = {'http': PROXY_URL, 'https': PROXY_URL}
+                
+                # إجراء طلب اختبار مع timeout قصير
+                response = await asyncio.to_thread(
+                    requests.get, 
+                    test_url, 
+                    proxies=proxies, 
+                    timeout=10,
+                    headers={'User-Agent': random.choice(USER_AGENTS)}
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    proxy_ip = data.get('origin', data.get('ip', 'غير معروف'))
+                    
+                    # حفظ في الكاش
+                    self.proxy_status[cache_key] = True
+                    
+                    logger.info(f"البروكسي يعمل بنجاح! IP الجديد: {proxy_ip}")
+                    return {
+                        'status': 'success',
+                        'working': True,
+                        'proxy_ip': proxy_ip,
+                        'test_url': test_url
+                    }
+                    
+            except Exception as e:
+                logger.warning(f"فشل اختبار البروكسي مع {test_url}: {e}")
+                continue
+        
+        # فشل جميع الاختبارات
+        self.proxy_status[cache_key] = False
+        logger.error("فشل في الاتصال بالبروكسي!")
+        return {
+            'status': 'failed',
+            'working': False,
+            'message': 'فشل في الاتصال بالبروكسي'
+        }
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالج أمر /start"""
@@ -60,12 +271,122 @@ class YouTubeTelegramBot:
 4. انتظر التحميل والإرسال
 
 🔗 أرسل رابط الفيديو الآن!
+
+📋 **الأوامر المتاحة:**
+• `/test [video_id]` - اختبار الطرق البديلة
+• `/proxy` - فحص حالة البروكسي
         """
         
         await update.message.reply_text(
             welcome_message,
             parse_mode=ParseMode.MARKDOWN
         )
+
+    async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """اختبار الطرق البديلة لاستخراج معلومات الفيديو"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ يرجى تحديد معرف الفيديو أو رابط كامل\n"
+                "مثال: `/test dQw4w9WgXcQ`\n"
+                "أو: `/test https://www.youtube.com/watch?v=dQw4w9WgXcQ`"
+            )
+            return
+        
+        input_text = context.args[0]
+        
+        # محاولة استخراج معرف الفيديو
+        if input_text.startswith('http'):
+            video_id = self.extract_video_id(input_text)
+            if not video_id:
+                await update.message.reply_text("❌ فشل في استخراج معرف الفيديو من الرابط")
+                return
+        else:
+            video_id = input_text
+        
+        test_message = await update.message.reply_text(
+            f"🧪 جاري اختبار الطرق البديلة لمعرف الفيديو: `{video_id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # اختبار الطرق البديلة
+            result = await self.get_video_info_direct(video_id)
+            
+            if result and 'title' in result:
+                method = result.get('method', 'غير معروف')
+                title = result.get('title', 'غير معروف')
+                uploader = result.get('uploader', 'غير معروف')
+                duration = self.format_duration(result.get('duration', 0))
+                
+                success_msg = f"""
+✅ **نجح الاختبار!**
+
+🎬 **العنوان:** {title[:50]}
+👤 **القناة:** {uploader}
+⏱️ **المدة:** {duration}
+🔧 **الطريقة:** {method}
+
+💡 الطرق البديلة تعمل بنجاح!
+                """
+                
+                await test_message.edit_text(success_msg, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await test_message.edit_text(
+                    "❌ فشل في جميع الطرق البديلة\n"
+                    "قد يكون الفيديو غير متاح أو محذوف"
+                )
+                
+        except Exception as e:
+            logger.error(f"خطأ في اختبار الطرق البديلة: {e}")
+            await test_message.edit_text(
+                f"❌ حدث خطأ أثناء الاختبار:\n`{str(e)}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    async def proxy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """فحص حالة البروكسي"""
+        status_message = await update.message.reply_text("🌐 جاري فحص حالة البروكسي...")
+        
+        try:
+            proxy_test = await self.test_proxy_connection()
+            
+            if proxy_test['status'] == 'disabled':
+                await status_message.edit_text(
+                    "ℹ️ **حالة البروكسي:** غير مفعل\n\n"
+                    "لتفعيل البروكسي، قم بتعديل ملف `.env`:\n"
+                    "```\n"
+                    "USE_PROXY=true\n"
+                    "PROXY_URL=http://user:pass@proxy:port\n"
+                    "```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif proxy_test['status'] == 'success':
+                proxy_ip = proxy_test.get('proxy_ip', 'غير معروف')
+                test_url = proxy_test.get('test_url', 'غير معروف')
+                
+                await status_message.edit_text(
+                    f"✅ **البروكسي يعمل بنجاح!**\n\n"
+                    f"🌐 **IP الحالي:** `{proxy_ip}`\n"
+                    f"🔗 **تم الاختبار مع:** {test_url}\n"
+                    f"📡 **حالة الاتصال:** متصل",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await status_message.edit_text(
+                    "❌ **فشل في الاتصال بالبروكسي!**\n\n"
+                    "💡 **تحقق من:**\n"
+                    "• صحة بيانات البروكسي في ملف .env\n"
+                    "• أن البروكسي متاح ويعمل\n"
+                    "• الاتصال بالإنترنت",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+        except Exception as e:
+            logger.error(f"خطأ في فحص البروكسي: {e}")
+            await status_message.edit_text(
+                f"❌ حدث خطأ أثناء فحص البروكسي:\n`{str(e)}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
     async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """معالج الروابط المرسلة"""
@@ -82,6 +403,36 @@ class YouTubeTelegramBot:
         
         # إرسال رسالة انتظار
         loading_message = await update.message.reply_text(
+            "🔍 جاري تحليل الفيديو...\nيرجى الانتظار..."
+        )
+        
+        # فحص البروكسي إذا كان مفعلاً
+        if USE_PROXY and PROXY_URL:
+            await loading_message.edit_text(
+                "🔍 جاري تحليل الفيديو...\n🌐 فحص اتصال البروكسي..."
+            )
+            
+            proxy_test = await self.test_proxy_connection()
+            if proxy_test['status'] == 'failed':
+                await loading_message.edit_text(
+                    "❌ **فشل في الاتصال بالبروكسي!**\n\n"
+                    "💡 **الحلول المقترحة:**\n"
+                    "• تحقق من صحة بيانات البروكسي في ملف .env\n"
+                    "• جرب بروكسي آخر\n"
+                    "• تعطيل البروكسي مؤقتاً (USE_PROXY=false)\n\n"
+                    "🔧 **تفاصيل الخطأ:** البروكسي غير متاح أو بيانات خاطئة",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            elif proxy_test['status'] == 'success':
+                proxy_ip = proxy_test.get('proxy_ip', 'غير معروف')
+                await loading_message.edit_text(
+                    f"🔍 جاري تحليل الفيديو...\n"
+                    f"🌐 البروكسي متصل بنجاح! IP: {proxy_ip}"
+                )
+                await asyncio.sleep(1)  # عرض رسالة النجاح لثانية واحدة
+        
+        await loading_message.edit_text(
             "🔍 جاري تحليل الفيديو...\nيرجى الانتظار..."
         )
         
@@ -217,22 +568,38 @@ class YouTubeTelegramBot:
         return opts
 
     async def get_video_info(self, url: str) -> Optional[Dict]:
-        """الحصول على معلومات الفيديو مع معالجة أفضل للأخطاء"""
-        max_retries = 3
+        """الحصول على معلومات الفيديو مع طرق بديلة لتجنب مشاكل yt-dlp"""
+        
+        # أولاً: محاولة استخراج معرف الفيديو واستخدام الطرق البديلة
+        video_id = self.extract_video_id(url)
+        if video_id:
+            logger.info(f"جاري تجريب الطرق البديلة لمعرف الفيديو: {video_id}")
+            
+            # تجريب الطرق البديلة أولاً
+            direct_info = await self.get_video_info_direct(video_id)
+            if direct_info and 'title' in direct_info:
+                logger.info(f"نجح في الحصول على معلومات الفيديو بالطريقة البديلة: {direct_info.get('method', 'unknown')}")
+                return direct_info
+        
+        # إذا فشلت الطرق البديلة، جرب yt-dlp
+        logger.info("جاري تجريب yt-dlp كخيار احتياطي...")
+        max_retries = 2  # تقليل عدد المحاولات لـ yt-dlp
         
         for attempt in range(max_retries):
             try:
                 # إضافة تأخير عشوائي بين المحاولات
                 if attempt > 0:
-                    delay = random.uniform(2, 5) * attempt
-                    logger.info(f"إعادة المحاولة {attempt + 1} بعد {delay:.1f} ثانية...")
+                    delay = random.uniform(3, 6) * attempt
+                    logger.info(f"إعادة المحاولة مع yt-dlp {attempt + 1} بعد {delay:.1f} ثانية...")
                     await asyncio.sleep(delay)
                 
                 ydl_opts = self.get_ydl_opts()
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                    return info
+                    if info:
+                        info['method'] = 'yt-dlp'
+                        return info
                     
             except yt_dlp.utils.GeoRestrictedError as e:
                 logger.error(f"الفيديو غير متاح في هذا البلد: {e}")
@@ -241,8 +608,17 @@ class YouTubeTelegramBot:
             except yt_dlp.utils.ExtractorError as e:
                 error_msg = str(e).lower()
                 if 'sign in' in error_msg or 'not a bot' in error_msg:
-                    logger.error(f"يوتيوب يطلب تسجيل الدخول: {e}")
+                    logger.error(f"يوتيوب يطلب تسجيل الدخول - جاري تجريب الطرق البديلة: {e}")
+                    
+                    # إذا كان لدينا معرف الفيديو، جرب الطرق البديلة مرة أخرى مع تأخير
+                    if video_id:
+                        await asyncio.sleep(random.uniform(2, 4))
+                        direct_info = await self.get_video_info_direct(video_id)
+                        if direct_info:
+                            return direct_info
+                    
                     return {'error': 'login_required', 'message': str(e)}
+                    
                 elif 'private' in error_msg or 'unavailable' in error_msg:
                     logger.error(f"الفيديو غير متاح: {e}")
                     return {'error': 'unavailable', 'message': str(e)}
@@ -252,8 +628,15 @@ class YouTubeTelegramBot:
                         return {'error': 'extraction_failed', 'message': str(e)}
                     
             except Exception as e:
-                logger.error(f"خطأ عام في استخراج معلومات الفيديو: {e}")
+                logger.error(f"خطأ عام في yt-dlp: {e}")
                 if attempt == max_retries - 1:
+                    # محاولة أخيرة بالطرق البديلة
+                    if video_id:
+                        logger.info("محاولة أخيرة بالطرق البديلة...")
+                        direct_info = await self.get_video_info_direct(video_id)
+                        if direct_info:
+                            return direct_info
+                    
                     return {'error': 'unknown', 'message': str(e)}
         
         return None
@@ -496,6 +879,8 @@ def main():
     
     # إضافة معالجات الأوامر
     application.add_handler(CommandHandler("start", bot.start_command))
+    application.add_handler(CommandHandler("test", bot.test_command))
+    application.add_handler(CommandHandler("proxy", bot.proxy_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_url))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
     
