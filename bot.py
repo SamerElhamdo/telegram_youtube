@@ -11,7 +11,6 @@ from typing import Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode
-import yt_dlp
 import aiofiles
 from dotenv import load_dotenv
 
@@ -195,6 +194,415 @@ class YouTubeTelegramBot:
         except Exception as e:
             logger.warning(f"فشل في YouTube Data API: {e}")
             raise
+    
+    async def extract_download_links(self, video_id: str) -> Optional[Dict]:
+        """استخراج روابط التحميل المباشرة من يوتيوب"""
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            response = await asyncio.to_thread(
+                requests.get, url, 
+                proxies=proxies, 
+                headers=headers, 
+                timeout=15
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"فشل في الحصول على صفحة الفيديو: {response.status_code}")
+                return None
+            
+            html = response.text
+            
+            # البحث عن بيانات التكوين الخاصة بالمشغل
+            config_patterns = [
+                r'ytInitialPlayerResponse\s*=\s*({.+?});',
+                r'var\s+ytInitialPlayerResponse\s*=\s*({.+?});',
+                r'window\["ytInitialPlayerResponse"\]\s*=\s*({.+?});'
+            ]
+            
+            player_config = None
+            for pattern in config_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    try:
+                        player_config = json.loads(match.group(1))
+                        logger.info("تم العثور على تكوين المشغل")
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            
+            if not player_config:
+                logger.error("فشل في العثور على تكوين المشغل")
+                return None
+            
+            # استخراج معلومات التدفق
+            streaming_data = player_config.get('streamingData', {})
+            if not streaming_data:
+                logger.error("لا توجد بيانات تدفق متاحة")
+                return None
+            
+            formats = []
+            
+            # إضافة التنسيقات العادية
+            if 'formats' in streaming_data:
+                for fmt in streaming_data['formats']:
+                    if 'url' in fmt:
+                        formats.append({
+                            'itag': fmt.get('itag'),
+                            'url': fmt['url'],
+                            'quality': fmt.get('quality', 'unknown'),
+                            'type': 'video',
+                            'ext': self._get_extension_from_mime(fmt.get('mimeType', '')),
+                            'filesize': fmt.get('contentLength'),
+                            'width': fmt.get('width'),
+                            'height': fmt.get('height'),
+                            'fps': fmt.get('fps'),
+                            'vcodec': self._extract_codec(fmt.get('mimeType', ''), 'video'),
+                            'acodec': self._extract_codec(fmt.get('mimeType', ''), 'audio')
+                        })
+            
+            # إضافة التنسيقات التكيفية
+            if 'adaptiveFormats' in streaming_data:
+                for fmt in streaming_data['adaptiveFormats']:
+                    if 'url' in fmt:
+                        mime_type = fmt.get('mimeType', '')
+                        is_video = 'video/' in mime_type
+                        is_audio = 'audio/' in mime_type
+                        
+                        formats.append({
+                            'itag': fmt.get('itag'),
+                            'url': fmt['url'],
+                            'quality': fmt.get('qualityLabel', fmt.get('quality', 'unknown')),
+                            'type': 'video' if is_video else 'audio',
+                            'ext': self._get_extension_from_mime(mime_type),
+                            'filesize': fmt.get('contentLength'),
+                            'width': fmt.get('width'),
+                            'height': fmt.get('height'),
+                            'fps': fmt.get('fps'),
+                            'abr': fmt.get('averageBitrate'),
+                            'vcodec': self._extract_codec(mime_type, 'video') if is_video else 'none',
+                            'acodec': self._extract_codec(mime_type, 'audio') if is_audio else 'none'
+                        })
+            
+            if not formats:
+                logger.error("لم يتم العثور على أي تنسيقات للتحميل")
+                return None
+            
+            logger.info(f"تم العثور على {len(formats)} تنسيق للتحميل")
+            return {'formats': formats}
+            
+        except Exception as e:
+            logger.error(f"خطأ في استخراج روابط التحميل: {e}")
+            return None
+    
+    def _get_extension_from_mime(self, mime_type: str) -> str:
+        """استخراج امتداد الملف من نوع MIME"""
+        mime_map = {
+            'video/mp4': 'mp4',
+            'video/webm': 'webm',
+            'audio/mp4': 'm4a',
+            'audio/webm': 'webm',
+            'audio/mpeg': 'mp3'
+        }
+        
+        for mime, ext in mime_map.items():
+            if mime in mime_type:
+                return ext
+        
+        return 'unknown'
+    
+    def _extract_codec(self, mime_type: str, codec_type: str) -> str:
+        """استخراج معلومات الترميز من نوع MIME"""
+        if not mime_type:
+            return 'unknown'
+        
+        # البحث عن معلومات الترميز في MIME type
+        codec_match = re.search(r'codecs="([^"]+)"', mime_type)
+        if not codec_match:
+            return 'unknown'
+        
+        codecs = codec_match.group(1).split(', ')
+        
+        if codec_type == 'video':
+            video_codecs = ['avc1', 'vp9', 'vp8', 'av01']
+            for codec in codecs:
+                for vc in video_codecs:
+                    if codec.startswith(vc):
+                        return codec
+        elif codec_type == 'audio':
+            audio_codecs = ['mp4a', 'opus', 'vorbis']
+            for codec in codecs:
+                for ac in audio_codecs:
+                    if codec.startswith(ac):
+                        return codec
+        
+        return 'unknown'
+    
+    async def get_complete_video_info(self, video_id: str) -> Optional[Dict]:
+        """الحصول على معلومات الفيديو الكاملة مع الروابط باستخدام regex وHTML فقط"""
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            response = await asyncio.to_thread(
+                requests.get, url, 
+                proxies=proxies, 
+                headers=headers, 
+                timeout=15
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"فشل في الحصول على صفحة الفيديو: {response.status_code}")
+                return {'error': 'http_error', 'message': f'HTTP {response.status_code}'}
+            
+            html = response.text
+            
+            # فحص إذا كان الفيديو متاحاً
+            if 'Video unavailable' in html or 'This video is not available' in html:
+                return {'error': 'unavailable', 'message': 'الفيديو غير متاح'}
+            
+            if 'Private video' in html or 'This video is private' in html:
+                return {'error': 'private', 'message': 'الفيديو خاص'}
+            
+            # استخراج المعلومات الأساسية
+            video_info = {
+                'id': video_id,
+                'webpage_url': url,
+                'method': 'regex_html'
+            }
+            
+            # استخراج العنوان
+            title_patterns = [
+                r'<title>(.+?) - YouTube</title>',
+                r'"title":"([^"]+)"',
+                r'<meta name="title" content="([^"]+)"',
+                r'<meta property="og:title" content="([^"]+)"'
+            ]
+            
+            for pattern in title_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    title = match.group(1).replace('\\u0026', '&').replace('\\', '')
+                    video_info['title'] = title
+                    break
+            
+            if 'title' not in video_info:
+                video_info['title'] = 'عنوان غير معروف'
+            
+            # استخراج اسم القناة
+            channel_patterns = [
+                r'"ownerChannelName":"([^"]+)"',
+                r'"author":"([^"]+)"',
+                r'<link itemprop="name" content="([^"]+)"',
+                r'"channelName":"([^"]+)"'
+            ]
+            
+            for pattern in channel_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    uploader = match.group(1).replace('\\u0026', '&').replace('\\', '')
+                    video_info['uploader'] = uploader
+                    break
+            
+            if 'uploader' not in video_info:
+                video_info['uploader'] = 'قناة غير معروفة'
+            
+            # استخراج المدة
+            duration_patterns = [
+                r'"lengthSeconds":"(\d+)"',
+                r'"duration":"PT(\d+)M(\d+)S"',
+                r'<meta itemprop="duration" content="PT(\d+)M(\d+)S"'
+            ]
+            
+            duration = 0
+            for pattern in duration_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    if 'lengthSeconds' in pattern:
+                        duration = int(match.group(1))
+                    else:
+                        minutes = int(match.group(1))
+                        seconds = int(match.group(2))
+                        duration = minutes * 60 + seconds
+                    break
+            
+            video_info['duration'] = duration
+            
+            # استخراج الصورة المصغرة
+            thumbnail_patterns = [
+                r'"url":"(https://i\.ytimg\.com/vi/[^/]+/maxresdefault\.jpg)"',
+                r'"url":"(https://i\.ytimg\.com/vi/[^/]+/hqdefault\.jpg)"',
+                r'<meta property="og:image" content="([^"]+)"'
+            ]
+            
+            for pattern in thumbnail_patterns:
+                match = re.search(pattern, html)
+                if match:
+                    thumbnail = match.group(1).replace('\\', '')
+                    video_info['thumbnail'] = thumbnail
+                    break
+            
+            if 'thumbnail' not in video_info:
+                video_info['thumbnail'] = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+            
+            # استخراج روابط التحميل
+            formats = await self.extract_formats_from_html(html, video_id)
+            if formats:
+                video_info['formats'] = formats
+                logger.info(f"تم استخراج {len(formats)} تنسيق للتحميل")
+            else:
+                logger.warning("لم يتم العثور على روابط تحميل")
+                video_info['formats'] = []
+            
+            return video_info
+            
+        except Exception as e:
+            logger.error(f"خطأ في get_complete_video_info: {e}")
+            return {'error': 'extraction_error', 'message': str(e)}
+    
+    async def extract_formats_from_html(self, html: str, video_id: str) -> List[Dict]:
+        """استخراج تنسيقات التحميل من HTML"""
+        try:
+            formats = []
+            
+            # البحث عن بيانات التكوين الخاصة بالمشغل
+            config_patterns = [
+                r'var ytInitialPlayerResponse = ({.+?});',
+                r'ytInitialPlayerResponse\s*=\s*({.+?});',
+                r'window\["ytInitialPlayerResponse"\]\s*=\s*({.+?});'
+            ]
+            
+            player_config = None
+            for pattern in config_patterns:
+                matches = re.finditer(pattern, html, re.DOTALL)
+                for match in matches:
+                    try:
+                        config_text = match.group(1)
+                        # تنظيف JSON
+                        config_text = re.sub(r'\\n', '', config_text)
+                        config_text = re.sub(r'\\t', '', config_text)
+                        
+                        player_config = json.loads(config_text)
+                        logger.info("تم العثور على تكوين المشغل بنجاح")
+                        break
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"فشل في تحليل JSON: {e}")
+                        continue
+                
+                if player_config:
+                    break
+            
+            if not player_config:
+                logger.error("فشل في العثور على تكوين المشغل")
+                return []
+            
+            # استخراج معلومات التدفق
+            streaming_data = player_config.get('streamingData', {})
+            if not streaming_data:
+                logger.error("لا توجد بيانات تدفق متاحة")
+                return []
+            
+            # معالجة التنسيقات العادية
+            if 'formats' in streaming_data:
+                for fmt in streaming_data['formats']:
+                    if 'url' in fmt or 'signatureCipher' in fmt:
+                        format_info = self.process_format(fmt, 'video')
+                        if format_info:
+                            formats.append(format_info)
+            
+            # معالجة التنسيقات التكيفية
+            if 'adaptiveFormats' in streaming_data:
+                for fmt in streaming_data['adaptiveFormats']:
+                    if 'url' in fmt or 'signatureCipher' in fmt:
+                        mime_type = fmt.get('mimeType', '')
+                        format_type = 'video' if 'video/' in mime_type else 'audio'
+                        format_info = self.process_format(fmt, format_type)
+                        if format_info:
+                            formats.append(format_info)
+            
+            # ترتيب التنسيقات حسب الجودة
+            video_formats = [f for f in formats if f.get('type') == 'video']
+            audio_formats = [f for f in formats if f.get('type') == 'audio']
+            
+            # ترتيب الفيديو حسب الارتفاع
+            video_formats.sort(key=lambda x: x.get('height', 0), reverse=True)
+            # ترتيب الصوت حسب البت ريت
+            audio_formats.sort(key=lambda x: x.get('abr', 0), reverse=True)
+            
+            return video_formats + audio_formats
+            
+        except Exception as e:
+            logger.error(f"خطأ في استخراج التنسيقات: {e}")
+            return []
+    
+    def process_format(self, fmt: Dict, format_type: str) -> Optional[Dict]:
+        """معالجة تنسيق واحد"""
+        try:
+            # الحصول على الرابط
+            url = fmt.get('url')
+            if not url and 'signatureCipher' in fmt:
+                # معالجة التواقيع المشفرة (معقدة، قد نحتاج لتجاهلها)
+                logger.warning("تم تجاهل تنسيق مشفر")
+                return None
+            
+            if not url:
+                return None
+            
+            mime_type = fmt.get('mimeType', '')
+            
+            format_info = {
+                'itag': fmt.get('itag'),
+                'url': url,
+                'type': format_type,
+                'ext': self._get_extension_from_mime(mime_type),
+                'filesize': fmt.get('contentLength'),
+                'mime_type': mime_type
+            }
+            
+            if format_type == 'video':
+                format_info.update({
+                    'width': fmt.get('width'),
+                    'height': fmt.get('height'),
+                    'fps': fmt.get('fps'),
+                    'quality': fmt.get('qualityLabel', f"{fmt.get('height', 'unknown')}p"),
+                    'vcodec': self._extract_codec(mime_type, 'video'),
+                    'acodec': self._extract_codec(mime_type, 'audio') if 'audio/' not in mime_type else 'none'
+                })
+            elif format_type == 'audio':
+                format_info.update({
+                    'abr': fmt.get('averageBitrate', fmt.get('bitrate')),
+                    'asr': fmt.get('audioSampleRate'),
+                    'quality': f"{fmt.get('averageBitrate', 'unknown')} kbps",
+                    'vcodec': 'none',
+                    'acodec': self._extract_codec(mime_type, 'audio')
+                })
+            
+            return format_info
+            
+        except Exception as e:
+            logger.error(f"خطأ في معالجة التنسيق: {e}")
+            return None
         
     async def test_proxy_connection(self) -> Dict[str, any]:
         """اختبار اتصال البروكسي"""
@@ -309,14 +717,15 @@ class YouTubeTelegramBot:
         )
         
         try:
-            # اختبار الطرق البديلة
-            result = await self.get_video_info_direct(video_id)
+            # اختبار النظام الجديد
+            result = await self.get_complete_video_info(video_id)
             
-            if result and 'title' in result:
+            if result and 'title' in result and 'error' not in result:
                 method = result.get('method', 'غير معروف')
                 title = result.get('title', 'غير معروف')
                 uploader = result.get('uploader', 'غير معروف')
                 duration = self.format_duration(result.get('duration', 0))
+                formats_count = len(result.get('formats', []))
                 
                 success_msg = f"""
 ✅ **نجح الاختبار!**
@@ -325,15 +734,17 @@ class YouTubeTelegramBot:
 👤 **القناة:** {uploader}
 ⏱️ **المدة:** {duration}
 🔧 **الطريقة:** {method}
+📊 **التنسيقات المتاحة:** {formats_count}
 
-💡 الطرق البديلة تعمل بنجاح!
+💡 النظام الجديد يعمل بنجاح بدون yt-dlp!
                 """
                 
                 await test_message.edit_text(success_msg, parse_mode=ParseMode.MARKDOWN)
             else:
+                error_msg = result.get('message', 'خطأ غير معروف') if result else 'فشل في الاستخراج'
                 await test_message.edit_text(
-                    "❌ فشل في جميع الطرق البديلة\n"
-                    "قد يكون الفيديو غير متاح أو محذوف"
+                    f"❌ فشل في الاختبار\n"
+                    f"**السبب:** {error_msg}"
                 )
                 
         except Exception as e:
@@ -522,124 +933,30 @@ class YouTubeTelegramBot:
         youtube_domains = ['youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com']
         return any(domain in url for domain in youtube_domains)
 
-    def get_ydl_opts(self, for_download: bool = False) -> Dict:
-        """إنشاء خيارات yt-dlp محسنة"""
-        opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'user_agent': random.choice(USER_AGENTS),
-            'sleep_interval': random.uniform(1, 3),
-            'max_sleep_interval': 5,
-            'extractor_retries': 3,
-            'fragment_retries': 3,
-            'retry_sleep_functions': {
-                'http': lambda n: random.uniform(1, 3) * (2 ** n),
-                'fragment': lambda n: random.uniform(1, 2) * (2 ** n),
-            },
-            # إعدادات لتجنب اكتشاف البوت
-            'http_headers': {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-            },
-            # تجاهل الأخطاء المؤقتة
-            'ignoreerrors': False,
-            'extract_flat': False,
-        }
-        
-        # إضافة البروكسي إذا كان متاحاً
-        if USE_PROXY and PROXY_URL:
-            opts['proxy'] = PROXY_URL
-            logger.info("استخدام البروكسي للاتصال")
-        
-        # إعدادات إضافية للتحميل
-        if for_download:
-            opts.update({
-                'writesubtitles': False,
-                'writeautomaticsub': False,
-                'writedescription': False,
-                'writeinfojson': False,
-                'writethumbnail': False,
-            })
-        
-        return opts
+
 
     async def get_video_info(self, url: str) -> Optional[Dict]:
-        """الحصول على معلومات الفيديو مع طرق بديلة لتجنب مشاكل yt-dlp"""
+        """الحصول على معلومات الفيديو باستخدام regex وتحليل HTML فقط"""
         
-        # أولاً: محاولة استخراج معرف الفيديو واستخدام الطرق البديلة
+        # استخراج معرف الفيديو
         video_id = self.extract_video_id(url)
-        if video_id:
-            logger.info(f"جاري تجريب الطرق البديلة لمعرف الفيديو: {video_id}")
-            
-            # تجريب الطرق البديلة أولاً
-            direct_info = await self.get_video_info_direct(video_id)
-            if direct_info and 'title' in direct_info:
-                logger.info(f"نجح في الحصول على معلومات الفيديو بالطريقة البديلة: {direct_info.get('method', 'unknown')}")
-                return direct_info
+        if not video_id:
+            logger.error("فشل في استخراج معرف الفيديو من الرابط")
+            return {'error': 'invalid_url', 'message': 'رابط غير صحيح'}
         
-        # إذا فشلت الطرق البديلة، جرب yt-dlp
-        logger.info("جاري تجريب yt-dlp كخيار احتياطي...")
-        max_retries = 2  # تقليل عدد المحاولات لـ yt-dlp
+        logger.info(f"جاري تحليل الفيديو: {video_id}")
         
-        for attempt in range(max_retries):
-            try:
-                # إضافة تأخير عشوائي بين المحاولات
-                if attempt > 0:
-                    delay = random.uniform(3, 6) * attempt
-                    logger.info(f"إعادة المحاولة مع yt-dlp {attempt + 1} بعد {delay:.1f} ثانية...")
-                    await asyncio.sleep(delay)
-                
-                ydl_opts = self.get_ydl_opts()
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                    if info:
-                        info['method'] = 'yt-dlp'
-                        return info
-                    
-            except yt_dlp.utils.GeoRestrictedError as e:
-                logger.error(f"الفيديو غير متاح في هذا البلد: {e}")
-                return {'error': 'geo_restricted', 'message': str(e)}
-                
-            except yt_dlp.utils.ExtractorError as e:
-                error_msg = str(e).lower()
-                if 'sign in' in error_msg or 'not a bot' in error_msg:
-                    logger.error(f"يوتيوب يطلب تسجيل الدخول - جاري تجريب الطرق البديلة: {e}")
-                    
-                    # إذا كان لدينا معرف الفيديو، جرب الطرق البديلة مرة أخرى مع تأخير
-                    if video_id:
-                        await asyncio.sleep(random.uniform(2, 4))
-                        direct_info = await self.get_video_info_direct(video_id)
-                        if direct_info:
-                            return direct_info
-                    
-                    return {'error': 'login_required', 'message': str(e)}
-                    
-                elif 'private' in error_msg or 'unavailable' in error_msg:
-                    logger.error(f"الفيديو غير متاح: {e}")
-                    return {'error': 'unavailable', 'message': str(e)}
-                else:
-                    logger.error(f"خطأ في استخراج الفيديو: {e}")
-                    if attempt == max_retries - 1:
-                        return {'error': 'extraction_failed', 'message': str(e)}
-                    
-            except Exception as e:
-                logger.error(f"خطأ عام في yt-dlp: {e}")
-                if attempt == max_retries - 1:
-                    # محاولة أخيرة بالطرق البديلة
-                    if video_id:
-                        logger.info("محاولة أخيرة بالطرق البديلة...")
-                        direct_info = await self.get_video_info_direct(video_id)
-                        if direct_info:
-                            return direct_info
-                    
-                    return {'error': 'unknown', 'message': str(e)}
+        # الحصول على معلومات الفيديو والروابط في عملية واحدة
+        video_info = await self.get_complete_video_info(video_id)
         
-        return None
+        if not video_info:
+            return {'error': 'extraction_failed', 'message': 'فشل في استخراج معلومات الفيديو'}
+        
+        if 'error' in video_info:
+            return video_info
+        
+        logger.info(f"تم استخراج معلومات الفيديو بنجاح: {video_info.get('title', 'غير معروف')[:30]}...")
+        return video_info
 
     def create_quality_keyboard(self, video_info: Dict) -> InlineKeyboardMarkup:
         """إنشاء لوحة مفاتيح اختيار الجودة"""
@@ -648,22 +965,44 @@ class YouTubeTelegramBot:
         # جودات الفيديو المتاحة
         formats = video_info.get('formats', [])
         video_formats = {}
+        audio_formats = []
         
+        # تصنيف التنسيقات
         for fmt in formats:
-            if fmt.get('vcodec') != 'none' and fmt.get('height'):
+            if fmt.get('type') == 'video' and fmt.get('height'):
                 height = fmt.get('height')
-                ext = fmt.get('ext', 'mp4')
-                if height not in video_formats or fmt.get('filesize', 0) > video_formats[height].get('filesize', 0):
+                if height not in video_formats:
                     video_formats[height] = fmt
+                elif fmt.get('filesize', 0) > video_formats[height].get('filesize', 0):
+                    video_formats[height] = fmt
+            elif fmt.get('type') == 'audio' or (fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none'):
+                audio_formats.append(fmt)
+        
+        # إذا لم توجد تنسيقات من الطرق البديلة، استخدم التنسيق التقليدي
+        if not video_formats and not audio_formats:
+            # استخدام التنسيق القديم مع yt-dlp
+            for fmt in formats:
+                if fmt.get('vcodec') != 'none' and fmt.get('height'):
+                    height = fmt.get('height')
+                    if height not in video_formats or fmt.get('filesize', 0) > video_formats[height].get('filesize', 0):
+                        video_formats[height] = fmt
         
         # ترتيب الجودات من الأعلى للأقل
-        sorted_qualities = sorted(video_formats.keys(), reverse=True)
+        sorted_qualities = sorted(video_formats.keys(), reverse=True) if video_formats else []
         
         # إضافة أزرار الجودة
         for quality in sorted_qualities[:6]:  # أول 6 جودات
             quality_text = f"📹 {quality}p"
             callback_data = f"video_{quality}"
             keyboard.append([InlineKeyboardButton(quality_text, callback_data=callback_data)])
+        
+        # إذا لم توجد جودات فيديو، أضف خيارات عامة
+        if not sorted_qualities:
+            keyboard.extend([
+                [InlineKeyboardButton("📹 جودة عالية", callback_data="video_720")],
+                [InlineKeyboardButton("📹 جودة متوسطة", callback_data="video_480")],
+                [InlineKeyboardButton("📹 جودة منخفضة", callback_data="video_360")]
+            ])
         
         # إضافة خيار الصوت فقط
         keyboard.append([InlineKeyboardButton("🎵 صوت فقط (MP3)", callback_data="audio_mp3")])
@@ -700,9 +1039,9 @@ class YouTubeTelegramBot:
         try:
             if data.startswith("video_"):
                 quality = data.split("_")[1]
-                file_path = await self.download_video(session['url'], quality)
+                file_path = await self.download_video_with_fallback(session, quality)
             elif data.startswith("audio_"):
-                file_path = await self.download_audio(session['url'])
+                file_path = await self.download_audio_with_fallback(session)
             else:
                 await query.edit_message_text("❌ خيار غير صحيح!")
                 return
@@ -725,95 +1064,7 @@ class YouTubeTelegramBot:
             if user_id in self.user_sessions:
                 del self.user_sessions[user_id]
 
-    async def download_video(self, url: str, quality: str) -> Optional[str]:
-        """تحميل الفيديو بجودة محددة مع معالجة محسنة للأخطاء"""
-        output_path = os.path.join(DOWNLOAD_PATH, f"video_{quality}p_%(title)s.%(ext)s")
-        
-        ydl_opts = self.get_ydl_opts(for_download=True)
-        ydl_opts.update({
-            'format': f'best[height<={quality}]/best',
-            'outtmpl': output_path,
-        })
-        
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    delay = random.uniform(3, 6)
-                    logger.info(f"إعادة محاولة التحميل بعد {delay:.1f} ثانية...")
-                    await asyncio.sleep(delay)
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                    filename = ydl.prepare_filename(info)
-                    
-                    # التحقق من وجود الملف
-                    if os.path.exists(filename):
-                        return filename
-                    
-                    # البحث عن الملف بامتدادات مختلفة
-                    base_name = os.path.splitext(filename)[0]
-                    for ext in ['.mp4', '.webm', '.mkv', '.avi']:
-                        test_file = base_name + ext
-                        if os.path.exists(test_file):
-                            return test_file
-                    
-                    logger.error(f"لم يتم العثور على الملف المحمل: {filename}")
-                    
-            except Exception as e:
-                logger.error(f"خطأ في تحميل الفيديو (محاولة {attempt + 1}): {e}")
-                if attempt == max_retries - 1:
-                    return None
-        
-        return None
 
-    async def download_audio(self, url: str) -> Optional[str]:
-        """تحميل الصوت فقط مع معالجة محسنة للأخطاء"""
-        output_path = os.path.join(DOWNLOAD_PATH, "audio_%(title)s.%(ext)s")
-        
-        ydl_opts = self.get_ydl_opts(for_download=True)
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'outtmpl': output_path,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        })
-        
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    delay = random.uniform(3, 6)
-                    logger.info(f"إعادة محاولة تحميل الصوت بعد {delay:.1f} ثانية...")
-                    await asyncio.sleep(delay)
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-                    filename = ydl.prepare_filename(info)
-                    
-                    # البحث عن ملف MP3
-                    audio_filename = os.path.splitext(filename)[0] + '.mp3'
-                    if os.path.exists(audio_filename):
-                        return audio_filename
-                    
-                    # البحث عن ملفات صوتية أخرى
-                    base_name = os.path.splitext(filename)[0]
-                    for ext in ['.m4a', '.webm', '.ogg', '.wav']:
-                        test_file = base_name + ext
-                        if os.path.exists(test_file):
-                            return test_file
-                    
-                    logger.error(f"لم يتم العثور على الملف الصوتي: {audio_filename}")
-                    
-            except Exception as e:
-                logger.error(f"خطأ في تحميل الصوت (محاولة {attempt + 1}): {e}")
-                if attempt == max_retries - 1:
-                    return None
-        
-        return None
 
     async def send_file(self, query, file_path: str):
         """إرسال الملف للمستخدم"""
@@ -866,6 +1117,153 @@ class YouTubeTelegramBot:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         else:
             return f"{minutes:02d}:{seconds:02d}"
+    
+    async def download_video_with_fallback(self, session: Dict, quality: str) -> Optional[str]:
+        """تحميل الفيديو باستخدام الروابط المستخرجة بـ regex فقط"""
+        video_info = session.get('video_info', {})
+        
+        if 'formats' not in video_info or not video_info['formats']:
+            logger.error("لا توجد تنسيقات متاحة للتحميل")
+            return None
+        
+        logger.info("جاري التحميل المباشر باستخدام الروابط المستخرجة...")
+        return await self.download_direct_video(video_info, quality)
+    
+    async def download_audio_with_fallback(self, session: Dict) -> Optional[str]:
+        """تحميل الصوت باستخدام الروابط المستخرجة بـ regex فقط"""
+        video_info = session.get('video_info', {})
+        
+        if 'formats' not in video_info or not video_info['formats']:
+            logger.error("لا توجد تنسيقات متاحة للتحميل")
+            return None
+        
+        logger.info("جاري تحميل الصوت المباشر باستخدام الروابط المستخرجة...")
+        return await self.download_direct_audio(video_info)
+    
+    async def download_direct_video(self, video_info: Dict, quality: str) -> Optional[str]:
+        """تحميل الفيديو مباشرة من الروابط المستخرجة"""
+        try:
+            formats = video_info.get('formats', [])
+            target_quality = int(quality)
+            
+            # البحث عن أفضل تنسيق فيديو
+            best_format = None
+            best_score = -1
+            
+            for fmt in formats:
+                if fmt.get('type') == 'video' and fmt.get('height'):
+                    height = fmt.get('height')
+                    # حساب نقاط الجودة (كلما قرب من الجودة المطلوبة كان أفضل)
+                    score = 1000 - abs(height - target_quality)
+                    
+                    # إضافة نقاط إضافية للتنسيقات الأفضل
+                    if fmt.get('ext') == 'mp4':
+                        score += 100
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_format = fmt
+            
+            if not best_format:
+                logger.error("لم يتم العثور على تنسيق فيديو مناسب")
+                return None
+            
+            # تحميل الملف
+            download_url = best_format['url']
+            filename = f"video_{quality}p_{video_info.get('id', 'unknown')}.{best_format.get('ext', 'mp4')}"
+            file_path = os.path.join(DOWNLOAD_PATH, filename)
+            
+            logger.info(f"جاري تحميل الفيديو من: {download_url[:50]}...")
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            
+            response = await asyncio.to_thread(
+                requests.get, download_url,
+                proxies=proxies,
+                headers=headers,
+                stream=True,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                logger.info(f"تم تحميل الفيديو بنجاح: {file_path}")
+                return file_path
+            else:
+                logger.error(f"فشل في تحميل الفيديو: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"خطأ في التحميل المباشر للفيديو: {e}")
+            return None
+    
+    async def download_direct_audio(self, video_info: Dict) -> Optional[str]:
+        """تحميل الصوت مباشرة من الروابط المستخرجة"""
+        try:
+            formats = video_info.get('formats', [])
+            
+            # البحث عن أفضل تنسيق صوتي
+            best_format = None
+            best_score = -1
+            
+            for fmt in formats:
+                if fmt.get('type') == 'audio' or (fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none'):
+                    score = 0
+                    
+                    # تفضيل التنسيقات الأفضل
+                    if fmt.get('ext') in ['m4a', 'mp3']:
+                        score += 100
+                    
+                    # تفضيل البت ريت الأعلى
+                    if fmt.get('abr'):
+                        score += fmt.get('abr', 0)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_format = fmt
+            
+            if not best_format:
+                logger.error("لم يتم العثور على تنسيق صوتي مناسب")
+                return None
+            
+            # تحميل الملف
+            download_url = best_format['url']
+            filename = f"audio_{video_info.get('id', 'unknown')}.{best_format.get('ext', 'm4a')}"
+            file_path = os.path.join(DOWNLOAD_PATH, filename)
+            
+            logger.info(f"جاري تحميل الصوت من: {download_url[:50]}...")
+            
+            proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
+            headers = {'User-Agent': random.choice(USER_AGENTS)}
+            
+            response = await asyncio.to_thread(
+                requests.get, download_url,
+                proxies=proxies,
+                headers=headers,
+                stream=True,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                logger.info(f"تم تحميل الصوت بنجاح: {file_path}")
+                return file_path
+            else:
+                logger.error(f"فشل في تحميل الصوت: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"خطأ في التحميل المباشر للصوت: {e}")
+            return None
 
 def main():
     """تشغيل البوت"""
