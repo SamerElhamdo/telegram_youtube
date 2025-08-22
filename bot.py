@@ -472,8 +472,18 @@ class YouTubeTelegramBot:
                 video_info['formats'] = formats
                 logger.info(f"تم استخراج {len(formats)} تنسيق للتحميل")
             else:
-                logger.warning("لم يتم العثور على روابط تحميل")
-                video_info['formats'] = []
+                logger.warning("لم يتم العثور على روابط تحميل، جاري المحاولة بطرق بديلة...")
+                
+                # محاولة استخراج روابط بطريقة مختلفة
+                alternative_formats = await self.extract_alternative_formats(html, video_id)
+                if alternative_formats:
+                    video_info['formats'] = alternative_formats
+                    logger.info(f"تم استخراج {len(alternative_formats)} تنسيق بالطريقة البديلة")
+                else:
+                    logger.error("فشل في استخراج أي روابط تحميل")
+                    # لا نرجع خطأ، بل نعطي خيارات افتراضية
+                    video_info['formats'] = []
+                    video_info['no_direct_download'] = True
             
             return video_info
             
@@ -520,7 +530,21 @@ class YouTubeTelegramBot:
             # استخراج معلومات التدفق
             streaming_data = player_config.get('streamingData', {})
             if not streaming_data:
-                logger.error("لا توجد بيانات تدفق متاحة")
+                logger.warning("لا توجد streamingData، جاري البحث عن طرق بديلة...")
+                
+                # محاولة البحث عن بيانات أخرى
+                video_details = player_config.get('videoDetails', {})
+                if video_details.get('isLiveContent'):
+                    logger.error("هذا بث مباشر، غير مدعوم حالياً")
+                    return []
+                
+                # البحث عن بيانات في مواقع أخرى
+                microformat = player_config.get('microformat', {}).get('playerMicroformatRenderer', {})
+                if microformat:
+                    logger.info("تم العثور على microformat، محاولة استخراج بدائل...")
+                
+                # إذا لم نجد أي بيانات تدفق
+                logger.error("لا توجد بيانات تدفق متاحة - قد يكون الفيديو محمياً أو خاص")
                 return []
             
             # معالجة التنسيقات العادية
@@ -603,6 +627,108 @@ class YouTubeTelegramBot:
         except Exception as e:
             logger.error(f"خطأ في معالجة التنسيق: {e}")
             return None
+    
+    async def extract_alternative_formats(self, html: str, video_id: str) -> List[Dict]:
+        """طريقة بديلة لاستخراج التنسيقات عند فشل الطريقة الأساسية"""
+        try:
+            formats = []
+            
+            # البحث عن patterns مختلفة في HTML
+            alternative_patterns = [
+                r'"url":"([^"]+)".*?"itag":(\d+)',
+                r'"signatureCipher":"([^"]+)".*?"itag":(\d+)',
+                r'itag=(\d+).*?url=([^&]+)',
+            ]
+            
+            for pattern in alternative_patterns:
+                matches = re.finditer(pattern, html)
+                for match in matches:
+                    try:
+                        if len(match.groups()) >= 2:
+                            url = match.group(1) if 'url' in pattern else match.group(2)
+                            itag = match.group(2) if 'url' in pattern else match.group(1)
+                            
+                            # تنظيف URL
+                            if url.startswith('\\'):
+                                url = url.replace('\\', '')
+                            
+                            # إنشاء تنسيق أساسي
+                            format_info = {
+                                'itag': int(itag) if itag.isdigit() else 0,
+                                'url': url,
+                                'ext': 'mp4',  # افتراضي
+                                'type': 'video'  # افتراضي
+                            }
+                            
+                            # تخمين الجودة بناءً على itag
+                            quality_map = {
+                                22: {'height': 720, 'quality': '720p'},
+                                18: {'height': 360, 'quality': '360p'},
+                                140: {'type': 'audio', 'quality': '128kbps', 'ext': 'm4a'},
+                                251: {'type': 'audio', 'quality': '160kbps', 'ext': 'webm'},
+                            }
+                            
+                            if int(itag) in quality_map:
+                                format_info.update(quality_map[int(itag)])
+                            
+                            formats.append(format_info)
+                    except Exception as e:
+                        logger.warning(f"تجاهل تنسيق غير صحيح: {e}")
+                        continue
+            
+            # إزالة التكرارات
+            unique_formats = []
+            seen_itags = set()
+            for fmt in formats:
+                if fmt['itag'] not in seen_itags:
+                    unique_formats.append(fmt)
+                    seen_itags.add(fmt['itag'])
+            
+            logger.info(f"تم استخراج {len(unique_formats)} تنسيق بالطريقة البديلة")
+            return unique_formats
+            
+        except Exception as e:
+            logger.error(f"خطأ في الطريقة البديلة: {e}")
+            return []
+    
+    async def create_fallback_formats(self, video_id: str) -> List[Dict]:
+        """إنشاء تنسيقات افتراضية عند فشل جميع الطرق"""
+        try:
+            # تنسيقات يوتيوب الشائعة
+            common_formats = [
+                {
+                    'itag': 22,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',  # رابط وهمي
+                    'quality': '720p',
+                    'height': 720,
+                    'ext': 'mp4',
+                    'type': 'video',
+                    'fallback': True
+                },
+                {
+                    'itag': 18,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',  # رابط وهمي
+                    'quality': '360p', 
+                    'height': 360,
+                    'ext': 'mp4',
+                    'type': 'video',
+                    'fallback': True
+                },
+                {
+                    'itag': 140,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',  # رابط وهمي
+                    'quality': '128kbps',
+                    'ext': 'm4a',
+                    'type': 'audio',
+                    'fallback': True
+                }
+            ]
+            
+            return common_formats
+            
+        except Exception as e:
+            logger.error(f"خطأ في إنشاء التنسيقات الافتراضية: {e}")
+            return []
         
     async def test_proxy_connection(self) -> Dict[str, any]:
         """اختبار اتصال البروكسي"""
@@ -998,11 +1124,22 @@ class YouTubeTelegramBot:
         
         # إذا لم توجد جودات فيديو، أضف خيارات عامة
         if not sorted_qualities:
-            keyboard.extend([
-                [InlineKeyboardButton("📹 جودة عالية", callback_data="video_720")],
-                [InlineKeyboardButton("📹 جودة متوسطة", callback_data="video_480")],
-                [InlineKeyboardButton("📹 جودة منخفضة", callback_data="video_360")]
-            ])
+            if video_info.get('no_direct_download'):
+                # إذا لم نستطع الحصول على روابط مباشرة
+                keyboard.extend([
+                    [InlineKeyboardButton("📹 محاولة تحميل جودة عالية", callback_data="video_720")],
+                    [InlineKeyboardButton("📹 محاولة تحميل جودة متوسطة", callback_data="video_480")],
+                    [InlineKeyboardButton("🎵 محاولة تحميل الصوت", callback_data="audio_mp3")]
+                ])
+                
+                # إضافة تحذير
+                keyboard.append([InlineKeyboardButton("⚠️ قد لا يعمل التحميل المباشر", callback_data="warning")])
+            else:
+                keyboard.extend([
+                    [InlineKeyboardButton("📹 جودة عالية", callback_data="video_720")],
+                    [InlineKeyboardButton("📹 جودة متوسطة", callback_data="video_480")],
+                    [InlineKeyboardButton("📹 جودة منخفضة", callback_data="video_360")]
+                ])
         
         # إضافة خيار الصوت فقط
         keyboard.append([InlineKeyboardButton("🎵 صوت فقط (MP3)", callback_data="audio_mp3")])
@@ -1029,6 +1166,15 @@ class YouTubeTelegramBot:
             await query.edit_message_text("❌ تم إلغاء العملية.")
             return
         
+        if data == "warning":
+            await query.answer(
+                "⚠️ لم نتمكن من الحصول على روابط تحميل مباشرة لهذا الفيديو. "
+                "قد يكون الفيديو محمياً أو يتطلب معالجة خاصة. "
+                "يمكنك المحاولة لكن قد لا يعمل التحميل.",
+                show_alert=True
+            )
+            return
+        
         session = self.user_sessions[user_id]
         
         # تحديث رسالة التحميل
@@ -1053,7 +1199,28 @@ class YouTubeTelegramBot:
                 # حذف الملف بعد الإرسال
                 os.remove(file_path)
             else:
-                await query.edit_message_text("❌ فشل في تحميل الملف!")
+                # رسائل خطأ محسنة
+                video_info = session.get('video_info', {})
+                if video_info.get('no_direct_download'):
+                    await query.edit_message_text(
+                        "❌ **فشل في التحميل**\n\n"
+                        "🔒 هذا الفيديو محمي أو يتطلب معالجة خاصة.\n"
+                        "💡 **جرب:**\n"
+                        "• فيديو آخر من نفس القناة\n"
+                        "• استخدام VPN إذا كان متاحاً\n"
+                        "• المحاولة لاحقاً",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await query.edit_message_text(
+                        "❌ **فشل في تحميل الملف**\n\n"
+                        "💡 **الأسباب المحتملة:**\n"
+                        "• مشكلة مؤقتة في الخادم\n"
+                        "• انتهاء صلاحية الرابط\n"
+                        "• مشكلة في الاتصال\n\n"
+                        "🔄 جرب إعادة إرسال الرابط",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
                 
         except Exception as e:
             logger.error(f"خطأ في التحميل: {e}")
@@ -1123,8 +1290,18 @@ class YouTubeTelegramBot:
         video_info = session.get('video_info', {})
         
         if 'formats' not in video_info or not video_info['formats']:
-            logger.error("لا توجد تنسيقات متاحة للتحميل")
-            return None
+            if video_info.get('no_direct_download'):
+                logger.warning("لا توجد روابط مباشرة، محاولة إنشاء تنسيقات افتراضية...")
+                fallback_formats = await self.create_fallback_formats(video_info.get('id', ''))
+                if fallback_formats:
+                    video_info['formats'] = fallback_formats
+                    logger.info("تم إنشاء تنسيقات افتراضية")
+                else:
+                    logger.error("فشل في إنشاء تنسيقات افتراضية")
+                    return None
+            else:
+                logger.error("لا توجد تنسيقات متاحة للتحميل")
+                return None
         
         logger.info("جاري التحميل المباشر باستخدام الروابط المستخرجة...")
         return await self.download_direct_video(video_info, quality)
@@ -1134,8 +1311,18 @@ class YouTubeTelegramBot:
         video_info = session.get('video_info', {})
         
         if 'formats' not in video_info or not video_info['formats']:
-            logger.error("لا توجد تنسيقات متاحة للتحميل")
-            return None
+            if video_info.get('no_direct_download'):
+                logger.warning("لا توجد روابط مباشرة، محاولة إنشاء تنسيقات افتراضية...")
+                fallback_formats = await self.create_fallback_formats(video_info.get('id', ''))
+                if fallback_formats:
+                    video_info['formats'] = fallback_formats
+                    logger.info("تم إنشاء تنسيقات افتراضية")
+                else:
+                    logger.error("فشل في إنشاء تنسيقات افتراضية")
+                    return None
+            else:
+                logger.error("لا توجد تنسيقات متاحة للتحميل")
+                return None
         
         logger.info("جاري تحميل الصوت المباشر باستخدام الروابط المستخرجة...")
         return await self.download_direct_audio(video_info)
@@ -1166,6 +1353,12 @@ class YouTubeTelegramBot:
             
             if not best_format:
                 logger.error("لم يتم العثور على تنسيق فيديو مناسب")
+                return None
+            
+            # التحقق من التنسيقات الافتراضية
+            if best_format.get('fallback'):
+                logger.warning("استخدام تنسيق افتراضي - قد لا يعمل التحميل")
+                # في هذه الحالة، نحاول إنشاء رسالة خطأ مفيدة
                 return None
             
             # تحميل الملف
@@ -1229,6 +1422,11 @@ class YouTubeTelegramBot:
             
             if not best_format:
                 logger.error("لم يتم العثور على تنسيق صوتي مناسب")
+                return None
+            
+            # التحقق من التنسيقات الافتراضية
+            if best_format.get('fallback'):
+                logger.warning("استخدام تنسيق افتراضي - قد لا يعمل التحميل")
                 return None
             
             # تحميل الملف
