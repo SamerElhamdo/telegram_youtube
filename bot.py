@@ -1177,10 +1177,20 @@ class YouTubeTelegramBot:
         
         session = self.user_sessions[user_id]
         
-        # تحديث رسالة التحميل
-        await query.edit_message_text(
-            "⬇️ جاري التحميل...\nيرجى الانتظار، قد تستغرق العملية بضع دقائق."
-        )
+        # إنشاء callback لتحديث التقدم
+        async def progress_callback(message: str):
+            try:
+                await query.edit_message_text(message)
+            except Exception as e:
+                # تجاهل أخطاء التحديث السريع للرسائل
+                if "message is not modified" not in str(e).lower():
+                    logger.warning(f"خطأ في تحديث رسالة التقدم: {e}")
+        
+        # إضافة callback للجلسة
+        session['progress_callback'] = progress_callback
+        
+        # رسالة البداية
+        await progress_callback("⬇️ جاري التحضير للتحميل...")
         
         try:
             if data.startswith("video_"):
@@ -1193,6 +1203,9 @@ class YouTubeTelegramBot:
                 return
             
             if file_path and os.path.exists(file_path):
+                # تحديث الرسالة قبل الإرسال
+                await progress_callback("📤 جاري إرسال الملف...")
+                
                 # إرسال الملف
                 await self.send_file(query, file_path)
                 
@@ -1285,6 +1298,12 @@ class YouTubeTelegramBot:
         else:
             return f"{minutes:02d}:{seconds:02d}"
     
+    def create_progress_bar(self, percentage: float, length: int = 10) -> str:
+        """إنشاء شريط تقدم مرئي"""
+        filled_length = int(length * percentage / 100)
+        bar = '█' * filled_length + '░' * (length - filled_length)
+        return f"[{bar}]"
+    
     async def download_video_with_fallback(self, session: Dict, quality: str) -> Optional[str]:
         """تحميل الفيديو باستخدام الروابط المستخرجة بـ regex فقط"""
         video_info = session.get('video_info', {})
@@ -1304,7 +1323,10 @@ class YouTubeTelegramBot:
                 return None
         
         logger.info("جاري التحميل المباشر باستخدام الروابط المستخرجة...")
-        return await self.download_direct_video(video_info, quality)
+        
+        # إنشاء callback للتقدم إذا كان متاحاً
+        progress_callback = getattr(session, 'progress_callback', None)
+        return await self.download_direct_video(video_info, quality, progress_callback)
     
     async def download_audio_with_fallback(self, session: Dict) -> Optional[str]:
         """تحميل الصوت باستخدام الروابط المستخرجة بـ regex فقط"""
@@ -1325,10 +1347,13 @@ class YouTubeTelegramBot:
                 return None
         
         logger.info("جاري تحميل الصوت المباشر باستخدام الروابط المستخرجة...")
-        return await self.download_direct_audio(video_info)
+        
+        # إنشاء callback للتقدم إذا كان متاحاً
+        progress_callback = getattr(session, 'progress_callback', None)
+        return await self.download_direct_audio(video_info, progress_callback)
     
-    async def download_direct_video(self, video_info: Dict, quality: str) -> Optional[str]:
-        """تحميل الفيديو مباشرة من الروابط المستخرجة"""
+    async def download_direct_video(self, video_info: Dict, quality: str, progress_callback=None) -> Optional[str]:
+        """تحميل الفيديو مباشرة من الروابط المستخرجة مع شريط التقدم"""
         try:
             formats = video_info.get('formats', [])
             target_quality = int(quality)
@@ -1358,15 +1383,17 @@ class YouTubeTelegramBot:
             # التحقق من التنسيقات الافتراضية
             if best_format.get('fallback'):
                 logger.warning("استخدام تنسيق افتراضي - قد لا يعمل التحميل")
-                # في هذه الحالة، نحاول إنشاء رسالة خطأ مفيدة
                 return None
             
-            # تحميل الملف
+            # تحميل الملف مع شريط التقدم
             download_url = best_format['url']
             filename = f"video_{quality}p_{video_info.get('id', 'unknown')}.{best_format.get('ext', 'mp4')}"
             file_path = os.path.join(DOWNLOAD_PATH, filename)
             
             logger.info(f"جاري تحميل الفيديو من: {download_url[:50]}...")
+            
+            if progress_callback:
+                await progress_callback("🔗 الاتصال بالخادم...")
             
             proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
             headers = {'User-Agent': random.choice(USER_AGENTS)}
@@ -1380,10 +1407,64 @@ class YouTubeTelegramBot:
             )
             
             if response.status_code == 200:
+                # الحصول على حجم الملف
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded_size = 0
+                
+                if progress_callback:
+                    size_mb = total_size / (1024 * 1024) if total_size > 0 else 0
+                    await progress_callback(f"📥 بدء التحميل... ({size_mb:.1f} MB)")
+                
                 with open(file_path, 'wb') as f:
+                    chunk_count = 0
+                    start_time = time.time()
+                    last_update_time = start_time
+                    last_downloaded_size = 0
+                    
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                            downloaded_size += len(chunk)
+                            chunk_count += 1
+                            
+                            current_time = time.time()
+                            
+                            # تحديث التقدم كل 100 chunk أو كل 2 ثانية (حوالي 800KB)
+                            if progress_callback and (chunk_count % 100 == 0 or (current_time - last_update_time) >= 2) and total_size > 0:
+                                progress_percent = (downloaded_size / total_size) * 100
+                                downloaded_mb = downloaded_size / (1024 * 1024)
+                                total_mb = total_size / (1024 * 1024)
+                                
+                                # حساب سرعة التحميل
+                                elapsed_time = current_time - last_update_time
+                                if elapsed_time > 0:
+                                    speed_bytes = (downloaded_size - last_downloaded_size) / elapsed_time
+                                    speed_mb = speed_bytes / (1024 * 1024)
+                                    
+                                    # تقدير الوقت المتبقي
+                                    remaining_bytes = total_size - downloaded_size
+                                    eta_seconds = remaining_bytes / speed_bytes if speed_bytes > 0 else 0
+                                    eta_minutes = eta_seconds / 60
+                                    
+                                    # إنشاء شريط التقدم
+                                    progress_bar = self.create_progress_bar(progress_percent)
+                                    
+                                    eta_text = f"⏱️ {eta_minutes:.1f} دقيقة متبقية" if eta_minutes > 1 else f"⏱️ {eta_seconds:.0f} ثانية متبقية"
+                                    
+                                    await progress_callback(
+                                        f"📥 جاري التحميل...\n"
+                                        f"{progress_bar} {progress_percent:.1f}%\n"
+                                        f"📊 {downloaded_mb:.1f} MB / {total_mb:.1f} MB\n"
+                                        f"🚀 {speed_mb:.1f} MB/s\n"
+                                        f"{eta_text}"
+                                    )
+                                    
+                                    last_update_time = current_time
+                                    last_downloaded_size = downloaded_size
+                
+                if progress_callback:
+                    final_size_mb = downloaded_size / (1024 * 1024)
+                    await progress_callback(f"✅ تم التحميل بنجاح! ({final_size_mb:.1f} MB)")
                 
                 logger.info(f"تم تحميل الفيديو بنجاح: {file_path}")
                 return file_path
@@ -1393,10 +1474,12 @@ class YouTubeTelegramBot:
                 
         except Exception as e:
             logger.error(f"خطأ في التحميل المباشر للفيديو: {e}")
+            if progress_callback:
+                await progress_callback(f"❌ خطأ في التحميل: {str(e)[:50]}...")
             return None
     
-    async def download_direct_audio(self, video_info: Dict) -> Optional[str]:
-        """تحميل الصوت مباشرة من الروابط المستخرجة"""
+    async def download_direct_audio(self, video_info: Dict, progress_callback=None) -> Optional[str]:
+        """تحميل الصوت مباشرة من الروابط المستخرجة مع شريط التقدم"""
         try:
             formats = video_info.get('formats', [])
             
@@ -1429,12 +1512,15 @@ class YouTubeTelegramBot:
                 logger.warning("استخدام تنسيق افتراضي - قد لا يعمل التحميل")
                 return None
             
-            # تحميل الملف
+            # تحميل الملف مع شريط التقدم
             download_url = best_format['url']
             filename = f"audio_{video_info.get('id', 'unknown')}.{best_format.get('ext', 'm4a')}"
             file_path = os.path.join(DOWNLOAD_PATH, filename)
             
             logger.info(f"جاري تحميل الصوت من: {download_url[:50]}...")
+            
+            if progress_callback:
+                await progress_callback("🔗 الاتصال بالخادم...")
             
             proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
             headers = {'User-Agent': random.choice(USER_AGENTS)}
@@ -1448,10 +1534,63 @@ class YouTubeTelegramBot:
             )
             
             if response.status_code == 200:
+                # الحصول على حجم الملف
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded_size = 0
+                
+                if progress_callback:
+                    size_mb = total_size / (1024 * 1024) if total_size > 0 else 0
+                    await progress_callback(f"🎵 بدء تحميل الصوت... ({size_mb:.1f} MB)")
+                
                 with open(file_path, 'wb') as f:
+                    chunk_count = 0
+                    start_time = time.time()
+                    last_update_time = start_time
+                    last_downloaded_size = 0
+                    
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                            downloaded_size += len(chunk)
+                            chunk_count += 1
+                            
+                            current_time = time.time()
+                            
+                            # تحديث التقدم كل 50 chunk أو كل 1.5 ثانية للصوت
+                            if progress_callback and (chunk_count % 50 == 0 or (current_time - last_update_time) >= 1.5) and total_size > 0:
+                                progress_percent = (downloaded_size / total_size) * 100
+                                downloaded_mb = downloaded_size / (1024 * 1024)
+                                total_mb = total_size / (1024 * 1024)
+                                
+                                # حساب سرعة التحميل
+                                elapsed_time = current_time - last_update_time
+                                if elapsed_time > 0:
+                                    speed_bytes = (downloaded_size - last_downloaded_size) / elapsed_time
+                                    speed_mb = speed_bytes / (1024 * 1024)
+                                    
+                                    # تقدير الوقت المتبقي
+                                    remaining_bytes = total_size - downloaded_size
+                                    eta_seconds = remaining_bytes / speed_bytes if speed_bytes > 0 else 0
+                                    
+                                    # إنشاء شريط التقدم
+                                    progress_bar = self.create_progress_bar(progress_percent)
+                                    
+                                    eta_text = f"⏱️ {eta_seconds:.0f} ثانية متبقية" if eta_seconds > 0 else "⏱️ اكتمل تقريباً"
+                                    
+                                    await progress_callback(
+                                        f"🎵 جاري تحميل الصوت...\n"
+                                        f"{progress_bar} {progress_percent:.1f}%\n"
+                                        f"📊 {downloaded_mb:.1f} MB / {total_mb:.1f} MB\n"
+                                        f"🚀 {speed_mb:.1f} MB/s\n"
+                                        f"{eta_text}"
+                                    )
+                                    
+                                    last_update_time = current_time
+                                    last_downloaded_size = downloaded_size
+                
+                if progress_callback:
+                    final_size_mb = downloaded_size / (1024 * 1024)
+                    await progress_callback(f"✅ تم تحميل الصوت بنجاح! ({final_size_mb:.1f} MB)")
                 
                 logger.info(f"تم تحميل الصوت بنجاح: {file_path}")
                 return file_path
@@ -1461,6 +1600,8 @@ class YouTubeTelegramBot:
                 
         except Exception as e:
             logger.error(f"خطأ في التحميل المباشر للصوت: {e}")
+            if progress_callback:
+                await progress_callback(f"❌ خطأ في تحميل الصوت: {str(e)[:50]}...")
             return None
 
 def main():
